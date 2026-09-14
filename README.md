@@ -42,7 +42,7 @@ Ensure you have **Python 3.9+** installed on your system.
 ### 2. Clone the Repository
 
 ```bash
-git clone [https://github.com/your-username/drug-shield.git](https://github.com/your-username/drug-shield.git)
+git [clone https://github.com/Hcaordseh/DRUG-SHIELD-SYSTEM]
 cd drug-shield
 
 ```
