@@ -1,0 +1,66 @@
+{
+  "Scott_Cocaine": {
+    "reagent": "Scott Reagent",
+    "target_compound": "Cocaine HCl",
+    "color_name": "Cobalt Blue",
+    "target_lab": [38.0, 8.0, -48.0],
+    "tolerance_de": 25.0,
+    "ndps_section": "Sec. 21 (Commercial: 250g)"
+  },
+  "Marquis_Heroin": {
+    "reagent": "Marquis Reagent",
+    "target_compound": "Heroin / Morphine",
+    "color_name": "Deep Violet / Purple",
+    "target_lab": [24.0, 32.0, -18.0],
+    "tolerance_de": 22.0,
+    "ndps_section": "Sec. 21 (Commercial: 250g)"
+  },
+  "Marquis_Amphetamine": {
+    "reagent": "Marquis Reagent",
+    "target_compound": "Amphetamine / Meth",
+    "color_name": "Orange to Red-Brown",
+    "target_lab": [48.0, 42.0, 45.0],
+    "tolerance_de": 22.0,
+    "ndps_section": "Sec. 22 (Commercial: 50g)"
+  },
+  "Duquenois_THC": {
+    "reagent": "Duquenois-Levine",
+    "target_compound": "Cannabis / Resin / THC",
+    "color_name": "Indigo Violet Layer",
+    "target_lab": [28.0, 22.0, -28.0],
+    "tolerance_de": 24.0,
+    "ndps_section": "Sec. 20 (Commercial: 1kg / 20kg)"
+  },
+  "Mandelin_Meth": {
+    "reagent": "Mandelin Reagent",
+    "target_compound": "Methamphetamine",
+    "color_name": "Dark Green",
+    "target_lab": [42.0, -28.0, 22.0],
+    "tolerance_de": 22.0,
+    "ndps_section": "Sec. 22 (Commercial: 50g)"
+  },
+  "Mecke_Opiates": {
+    "reagent": "Mecke Reagent",
+    "target_compound": "Opiates / Oxycodone",
+    "color_name": "Olive to Blue-Green",
+    "target_lab": [35.0, -18.0, 15.0],
+    "tolerance_de": 22.0,
+    "ndps_section": "Sec. 21 (Commercial: 250g)"
+  },
+  "Ehrlich_LSD": {
+    "reagent": "Ehrlich Reagent",
+    "target_compound": "LSD / Indoles",
+    "color_name": "Pink to Purple",
+    "target_lab": [45.0, 38.0, -12.0],
+    "tolerance_de": 20.0,
+    "ndps_section": "Sec. 22 (Commercial: 0.1g)"
+  },
+  "Simons_Meth": {
+    "reagent": "Simon's Reagent",
+    "target_compound": "Methamphetamine (Secondary Amines)",
+    "color_name": "Bright Cobalt Blue",
+    "target_lab": [45.0, -4.0, -45.0],
+    "tolerance_de": 20.0,
+    "ndps_section": "Sec. 22 (Commercial: 50g)"
+  }
+}
