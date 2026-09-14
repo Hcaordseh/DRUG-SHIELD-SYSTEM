@@ -1,6 +1,6 @@
 # 🔬 DRUG-SHIELD: Universal Field Colorimetric Assayer
 
-**DRUG-SHIELD** is a Streamlit-powered forensic colorimeter and reagent intelligence companion designed to assist field interdiction teams in accurately analyzing chemical drug spot-tests. By standardizing color analysis through CIE $L^*a^*b^*$ metrics and CIEDE2000 calculations, DRUG-SHIELD removes human subjective error under varying lighting conditions.
+**DRUG-SHIELD** is a Streamlit-powered forensic colorimeter and reagent intelligence companion designed to assist field interdiction teams in accurately analyzing chemical drug spot-tests. By standardizing color analysis through CIE L*a*b* metrics and CIEDE2000 calculations, DRUG-SHIELD removes human subjective error under varying lighting conditions.
 
 ---
 
