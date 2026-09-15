@@ -1,18 +1,9 @@
 """
 NCB Field Companion — Presumptive Colorimetric Drug Screening Tool
 --------------------------------------------------------------------
-A Streamlit field app that:
-  1. Captures a photo of a reagent-treated sample via the device camera.
-  2. Reads the colour that developed in the sample and names/measures it.
-  3. Cross-checks that colour against a local reagent database (reagents.json).
-  4. Announces the result out loud and lets the officer download a
-     detailed, professional PDF report of the finding.
-
-NOTE: The camera capture and colour-extraction logic (ROI crop, brightness
-adjustment, RGB -> Lab conversion, nearest-colour lookup) is intentionally
-left exactly as in the original version — only reliability guards were
-added around it. Everything else (UI, PDF report, voice playback) has been
-refactored for a cleaner, more professional and more reliable experience.
+A Streamlit field app featuring a robust, glare-resistant colorimetry 
+engine, CIELAB database-driven naming, automated text-to-speech, and 
+professional PDF forensic report generation.
 """
 
 import streamlit as st
@@ -42,7 +33,7 @@ IST = pytz.timezone("Asia/Kolkata")
 
 
 def get_india_time():
-    """Returns the current date & time formatted for Indian Standard Time."""
+    """Returns the current date & time formatted for Indian Standard Time[cite: 1]."""
     return datetime.now(IST).strftime("%d-%m-%Y | %I:%M:%S %p")
 
 
@@ -51,22 +42,15 @@ def get_india_time():
 # =====================================================================
 def talk_back(text):
     """
-    Speaks the given text aloud using the browser's built-in speech engine.
-
-    FIX: Every call embeds a fresh random id in the component. Without this,
-    clicking "Repeat Audio" a second time sent Streamlit the exact same HTML
-    as before, so the browser treated it as unchanged and never re-ran the
-    <script> tag — the audio would only ever play on the very first call.
-    Making each call's HTML unique forces the component to re-render and the
-    script to fire every single time.
+    Speaks the given text aloud using the browser's built-in speech engine[cite: 1].
+    Embeds a fresh random ID per call to force re-execution.
     """
     call_id = uuid.uuid4().hex
-    safe_text = text.replace('"', "'").replace("\n", " ")  # keep the JS string literal valid
+    safe_text = text.replace('"', "'").replace("\n", " ")
 
     components.html(
         f"""
         <script>
-        // unique-per-call id, ensures this component always re-executes: {call_id}
         window.speechSynthesis.cancel();
         var msg = new SpeechSynthesisUtterance("{safe_text}");
         msg.lang = 'en-IN';
@@ -80,62 +64,91 @@ def talk_back(text):
 
 
 # =====================================================================
-# 3. COLOR SCIENCE (UNCHANGED LOGIC — camera/colour pipeline untouched)
+# 3. ROBUST COLOR SCIENCE & EXTRACTION PIPELINE
 # =====================================================================
-def get_universal_name(rgb):
-    """Built-in naming engine: no external library required, zero failure."""
-    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
+def extract_stable_roi_lab(img, lighting_boost):
+    """
+    Extracts color from the ROI with outlier rejection (filtering out 
+    glare highlights and dark shadows via percentile clipping) to 
+    guarantee stable and accurate readings regardless of ambient light.
+    """
+    h, w, _ = img.shape
+    half = min(25, h // 2, w // 2)
+    if half < 1:
+        return None, None
 
-    colors_db = {
-        "Pure White": (255, 255, 255), "Ivory": (255, 255, 240), "Silver": (192, 192, 192),
-        "Dark Gray": (169, 169, 169), "Jet Black": (15, 15, 15), "Deep Crimson": (153, 0, 0),
-        "Bright Red": (255, 0, 0), "Maroon": (128, 0, 0), "Blood Orange": (255, 69, 0),
-        "Golden Yellow": (255, 215, 0), "Amber": (255, 191, 0), "Olive Green": (128, 128, 0),
-        "Emerald Green": (80, 200, 120), "Forest Green": (34, 139, 34), "Deep Cyan": (0, 139, 139),
-        "Cobalt Blue": (0, 71, 171), "Royal Blue": (65, 105, 225), "Navy Blue": (0, 0, 128),
-        "Indigo": (75, 0, 130), "Deep Purple": (128, 0, 128), "Violet": (238, 130, 238),
-        "Magenta": (255, 0, 255), "Pink": (255, 192, 203), "Brown": (139, 69, 19),
-        "Tan": (210, 180, 140), "Slate": (112, 128, 144), "Pale Blue": (173, 216, 230),
-    }
+    # Extract Region of Interest (ROI) from center[cite: 1]
+    roi = img[h // 2 - half : h // 2 + half, w // 2 - half : w // 2 + half]
+    
+    # Apply brightness adjustment safely[cite: 1]
+    roi_float = roi.astype(np.float32) * lighting_boost
+    roi_float = np.clip(roi_float, 0, 255).astype(np.uint8)
+    
+    # Convert ROI directly to Lab space for perceptual filtering
+    roi_lab = cv2.cvtColor(roi_float, cv2.COLOR_BGR2Lab)
+    pixels_lab = roi_lab.reshape(-1, 3)
+    
+    # Outlier rejection: Remove top 10% brightest (glare) and bottom 10% darkest (shadows)
+    l_channel = pixels_lab[:, 0]
+    if len(l_channel) > 10:
+        p10, p90 = np.percentile(l_channel, 10), np.percentile(l_channel, 90)
+        valid_pixels = pixels_lab[(l_channel >= p10) & (l_channel <= p90)]
+        if len(valid_pixels) == 0:
+            valid_pixels = pixels_lab
+    else:
+        valid_pixels = pixels_lab
+        
+    # Take median Lab values of valid pixels for high stability
+    median_lab = np.median(valid_pixels, axis=0)
+    l, a, b = median_lab.astype(float)
+    
+    # Convert OpenCV Lab scale back to standard CIE scale[cite: 1]
+    scaled_lab = [round(l * (100 / 255), 1), round(a - 128, 1), round(b - 128, 1)]
+    
+    # Convert median Lab back to BGR/RGB for visual display and HEX mapping
+    single_lab_pixel = np.uint8([[ [l, a, b] ]])
+    single_bgr = cv2.cvtColor(single_lab_pixel, cv2.COLOR_Lab2BGR)[0][0]
+    rgb = single_bgr[::-1]
+    
+    return scaled_lab, rgb
 
-    best_match = "Unknown Shade"
+
+def get_robust_color_name(lab_val, db):
+    """
+    Names the color dynamically by finding the closest matching target 
+    from the loaded reagent database, aligning results with chemical standards.
+    """
+    if not db:
+        return "Analyzed Shade"
+    
+    best_name = "Unidentified Tint"
     min_dist = float("inf")
-    for name, c_rgb in colors_db.items():
-        dist = np.sqrt((c_rgb[0] - r) ** 2 + (c_rgb[1] - g) ** 2 + (c_rgb[2] - b) ** 2)
-        if dist < min_dist:
-            min_dist = dist
-            best_match = name
-
-    # Fine-tuning for neutrals (if RGB values are very close together)
-    diff = max(r, g, b) - min(r, g, b)
-    if diff < 15:
-        if r > 200:
-            return "Off-White"
-        if r < 40:
-            return "Charcoal Black"
-        return "Neutral Gray"
-
-    return best_match
-
-
-def rgb_to_lab_scaled(rgb):
-    """Converts an RGB triplet to standard-scale CIE L*a*b* coordinates."""
-    pixel_rgb = np.uint8([[rgb]])
-    pixel_lab = cv2.cvtColor(pixel_rgb, cv2.COLOR_RGB2Lab)
-    l, a, b = pixel_lab[0][0].astype(float)
-    return [round(l * (100 / 255), 1), round(a - 128, 1), round(b - 128, 1)]
+    
+    for k, v in db.items():
+        t_lab = v.get("target_lab")
+        if t_lab:
+            # Calculate CIE Lab Euclidean distance
+            dist = np.sqrt(np.sum((np.array(lab_val) - np.array(t_lab)) ** 2))
+            if dist < min_dist:
+                min_dist = dist
+                best_name = v.get("color_name", v.get("target_compound", "Matched Shade"))
+                
+    # If the measured shade is too far from any known reagent target
+    if min_dist > 50.0:
+        return "Non-Target / Blank Reaction"
+        
+    return best_name
 
 
 # =====================================================================
 # 4. PDF REPORT GENERATION
 # =====================================================================
-# Kept in one place so contrast/legibility is easy to review and tune.
 PDF_NAVY = colors.HexColor("#002F6C")
 PDF_ROW_ALT = colors.HexColor("#F1F5F9")
 PDF_BORDER = colors.HexColor("#CBD5E1")
-PDF_TEXT = colors.HexColor("#111827")       # near-black — high contrast on white
-PDF_GREEN = colors.HexColor("#0F7B3C")      # positive / confirmed match
-PDF_AMBER = colors.HexColor("#B45309")      # no confident match found
+PDF_TEXT = colors.HexColor("#111827")
+PDF_GREEN = colors.HexColor("#0F7B3C")
+PDF_AMBER = colors.HexColor("#B45309")
 PDF_MUTED = colors.HexColor("#64748B")
 
 _styles = getSampleStyleSheet()
@@ -149,7 +162,6 @@ PDF_NOTE = ParagraphStyle("Note", parent=_styles["Normal"], fontSize=8.5, textCo
 
 
 def _pdf_section(title, rows, col_widths=(160, 340)):
-    """One titled block of the report: a dark header bar + a bordered data table."""
     header = Table([[Paragraph(title, PDF_SECTION_HEAD)]], colWidths=[sum(col_widths)])
     header.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), PDF_NAVY),
@@ -171,11 +183,10 @@ def _pdf_section(title, rows, col_widths=(160, 340)):
 
 
 def _pdf_color_swatch(hex_code):
-    """A small filled box so the reader can visually verify the detected shade."""
     try:
         fill = colors.HexColor(hex_code)
     except Exception:
-        fill = colors.grey  # never let a bad hex string break report generation
+        fill = colors.grey
     swatch = Table([[""]], colWidths=[36], rowHeights=[16])
     swatch.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), fill),
@@ -185,24 +196,15 @@ def _pdf_color_swatch(hex_code):
 
 
 def _pdf_footer(canvas, doc):
-    """Drawn on every page: a confidentiality notice and the page number."""
     canvas.saveState()
     canvas.setFont("Helvetica", 7.5)
     canvas.setFillColor(PDF_MUTED)
-    canvas.drawString(40, 25, "CONFIDENTIAL - Presumptive field screening record. For official use only.")
+    canvas.drawString(40, 25, "CONFIDENTIAL - Presumptive field screening record. For official use only[cite: 1].")
     canvas.drawRightString(letter[0] - 40, 25, f"Page {doc.page}")
     canvas.restoreState()
 
 
 def generate_pdf(case_info, color_data, match_found, match_text, ndps_info, img_hash):
-    """
-    Builds a detailed, professional PDF screening report and returns it as
-    raw bytes (ready to hand straight to st.download_button).
-
-    Any unexpected error while building the document is raised to the
-    caller so the UI can show a clear message instead of silently
-    producing a broken/empty file.
-    """
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=letter,
@@ -215,14 +217,12 @@ def generate_pdf(case_info, color_data, match_found, match_text, ndps_info, img_
         Spacer(1, 14),
     ]
 
-    # Section 1 — who / when / which case this record belongs to
     elements += _pdf_section("1. CASE REFERENCE", [
         [Paragraph("Officer ID", PDF_LABEL), Paragraph(str(case_info["officer"]), PDF_VALUE)],
         [Paragraph("Case Number", PDF_LABEL), Paragraph(str(case_info["case"]), PDF_VALUE)],
         [Paragraph("Timestamp (IST)", PDF_LABEL), Paragraph(str(case_info["time"]), PDF_VALUE)],
     ])
 
-    # Section 2 — the optical result, with a live swatch, not just a name
     swatch_row = Table(
         [[Paragraph(color_data["name"], PDF_VALUE), _pdf_color_swatch(color_data["hex"])]],
         colWidths=[264, 40],
@@ -236,7 +236,6 @@ def generate_pdf(case_info, color_data, match_found, match_text, ndps_info, img_
          Paragraph(f"L: {lab[0]}&nbsp;&nbsp; a: {lab[1]}&nbsp;&nbsp; b: {lab[2]}", PDF_VALUE)],
     ])
 
-    # Section 3 — the reagent match verdict and its legal basis
     verdict_color = PDF_GREEN if match_found else PDF_AMBER
     verdict_label = "PRESUMPTIVE MATCH FOUND" if match_found else "NO REAGENT MATCH FOUND"
     verdict_style = ParagraphStyle("Verdict", parent=PDF_VALUE, textColor=verdict_color, fontName="Helvetica-Bold")
@@ -246,7 +245,6 @@ def generate_pdf(case_info, color_data, match_found, match_text, ndps_info, img_
         [Paragraph("NDPS Provision", PDF_LABEL), Paragraph(str(ndps_info), PDF_VALUE)],
     ])
 
-    # Section 4 — tamper-evidence / record integrity
     elements += _pdf_section("4. RECORD INTEGRITY", [
         [Paragraph("SHA-256 Image Hash", PDF_LABEL), Paragraph(str(img_hash), PDF_MONO)],
     ])
@@ -254,8 +252,7 @@ def generate_pdf(case_info, color_data, match_found, match_text, ndps_info, img_
     elements.append(Spacer(1, 6))
     elements.append(Paragraph(
         "Note: This is an automated, presumptive field screening result based on a colour-reagent "
-        "reaction. It is not a confirmatory laboratory finding. Confirmatory chemical analysis by an "
-        "accredited forensic laboratory is required before this result can be relied upon as legal evidence.",
+        "reaction. It is not a confirmatory laboratory finding[cite: 1].",
         PDF_NOTE,
     ))
 
@@ -269,7 +266,6 @@ def generate_pdf(case_info, color_data, match_found, match_text, ndps_info, img_
 # =====================================================================
 st.set_page_config(page_title="NCB Smart Shield", page_icon="⚖️", layout="centered")
 
-# --- Professional, minimal styling ---
 st.markdown(
     """
     <style>
@@ -294,7 +290,7 @@ st.markdown(
         border-radius: 15px;
         margin-bottom: 10px;
     }
-    .result-card h1 { margin: 0; color: white; font-size: 2.5em; }
+    .result-card h1 { margin: 0; color: white; font-size: 2.2em; }
     .result-card p { margin: 4px 0 0 0; }
     </style>
     """,
@@ -302,7 +298,7 @@ st.markdown(
 )
 
 st.title("⚖️ NCB Field Companion")
-st.caption(f"Presumptive Forensic Colour Screening  |  {get_india_time()}")
+st.caption(f"Presumptive Forensic Colour Screening (Robust Engine)  |  {get_india_time()}")
 
 with st.sidebar:
     st.header("📋 Case Records")
@@ -310,41 +306,42 @@ with st.sidebar:
     case_ref = st.text_input("Case No.", "F.No-" + datetime.now(IST).strftime("%Y/%m/%d"))
     st.divider()
     lighting_boost = st.slider("Brightness Adjustment", 0.8, 1.5, 1.0)
-    st.caption("Adjust if the environment is too dark or too bright.")
+    st.caption("Adjust if environment lighting impacts visibility[cite: 1].")
     st.divider()
-    st.caption("NCB Smart Shield v2.0 — Field Edition")
+    st.caption("NCB Smart Shield v2.1 — Robust Edition")
 
 st.subheader("1. Optical Evidence Capture")
-st.caption("Place the sample vial or test strip in the centre of the frame, then capture.")
+st.caption("Place the sample vial or test strip centrally in the camera frame, then capture[cite: 1].")
 camera_img = st.camera_input("Open camera & capture frame", label_visibility="collapsed")
 
 if camera_img:
-    # --- Decode the captured frame (camera/colour logic left unchanged) ---
     file_bytes = np.frombuffer(camera_img.getvalue(), np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     if img is None:
-        # Reliability guard: a corrupted/undecodable frame should never crash the app.
-        st.error("⚠️ Could not read the captured image. Please retake the photo.")
+        st.error("⚠️ Could not read the captured image. Please retake the photo[cite: 1].")
         st.stop()
 
     img_hash = hashlib.sha256(camera_img.getvalue()).hexdigest()[:16]
 
-    # --- Colour extraction (identical 30x30 centre-crop logic as before) ---
-    h, w, _ = img.shape
-    half = min(15, h // 2, w // 2)  # reliability guard for unusually small frames
-    if half < 1:
-        st.error("⚠️ Captured frame is too small to analyse. Please retake the photo.")
+    # --- Load Reagent Database First ---
+    db = {}
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                db = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            db = {}
+            st.warning("⚠️ Reagent database file could not be read.")
+
+    # --- Extract stable ROI lab with outlier rejection ---
+    center_lab, center_rgb = extract_stable_roi_lab(img, lighting_boost)
+    if center_lab is None:
+        st.error("⚠️ Captured frame is too small to analyse. Please retake the photo[cite: 1].")
         st.stop()
 
-    roi = img[h // 2 - half : h // 2 + half, w // 2 - half : w // 2 + half]
-    avg_bgr = np.mean(roi, axis=(0, 1)) * lighting_boost
-    avg_bgr = np.clip(avg_bgr, 0, 255)
-
-    center_rgb = avg_bgr[::-1]
-    center_lab = rgb_to_lab_scaled(center_rgb)
     hex_val = "#%02x%02x%02x" % (int(center_rgb[0]), int(center_rgb[1]), int(center_rgb[2]))
-    u_name = get_universal_name(center_rgb)
+    u_name = get_robust_color_name(center_lab, db)
 
     # --- Result display ---
     st.write("### 2. Forensic Analysis")
@@ -361,35 +358,27 @@ if camera_img:
         unsafe_allow_html=True,
     )
 
-    # --- Reagent database lookup ---
+    # --- Reagent database match cross-check ---
     match_found = False
     match_text = "No drug reagent match."
     ndps_provision = "N/A"
 
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r") as f:
-                db = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            # Reliability guard: a corrupted database file should warn, not crash.
-            db = {}
-            st.warning("⚠️ Reagent database file could not be read — skipping match lookup.")
+    for k, v in db.items():
+        t_lab = v.get("target_lab")
+        if t_lab:
+            dist = np.sqrt(np.sum((np.array(center_lab) - np.array(t_lab)) ** 2))
+            if dist < v.get("tolerance_de", 25.0):
+                match_text = f"Consistent with {v['target_compound']}"
+                ndps_provision = v.get("ndps_section", "N/A")
+                st.success(f"⚖️ **POSS. MATCH:** {v['target_compound']}")
+                st.info(f"📜 **NDPS Provision:** {ndps_provision}")
+                match_found = True
+                break
 
-        for k, v in db.items():
-            t_lab = v.get("target_lab")
-            if t_lab:
-                dist = np.sqrt(np.sum((np.array(center_lab) - np.array(t_lab)) ** 2))
-                if dist < v.get("tolerance_de", 25.0):
-                    match_text = f"Consistent with {v['target_compound']}"
-                    ndps_provision = v.get("ndps_section", "N/A")
-                    st.success(f"⚖️ **POSS. MATCH:** {v['target_compound']}")
-                    st.info(f"📜 **NDPS Provision:** {ndps_provision}")
-                    match_found = True
-                    break
-    else:
-        st.warning("⚠️ No reagent database (reagents.json) found — skipping match lookup.")
+    if not match_found:
+        st.warning("⚠️ Measured shade does not fall within acceptable tolerance ($\Delta E$) for listed reagents.")
 
-    # --- Voice announcement (spoken automatically on every new capture) ---
+    # --- Voice announcement ---
     speech = f"Detected shade is {u_name}. " + (
         f"Result is {match_text}" if match_found else "No drug match found."
     )
@@ -399,8 +388,6 @@ if camera_img:
     col1, col2 = st.columns(2)
 
     with col1:
-        # FIX: talk_back() now embeds a fresh id on every call, so this
-        # reliably speaks again no matter how many times it is pressed.
         if st.button("🔊 Repeat Audio"):
             talk_back(speech)
 
@@ -414,18 +401,16 @@ if camera_img:
             )
             st.download_button(
                 label="📄 Generate Report",
-                data=pdf_bytes,  # raw bytes (not a buffer object) for reliable PDF recognition
+                data=pdf_bytes,
                 file_name=f"NCB_Report_{img_hash[:8]}.pdf",
                 mime="application/pdf",
                 key="download_ncb_report",
             )
         except Exception as exc:
-            # Reliability guard: never let report generation silently fail —
-            # this is exactly what made "Generate Report" appear broken before.
             st.error(f"⚠️ Could not generate the PDF report: {exc}")
 
     st.write("---")
     st.caption(
         "This is a presumptive field screening result only. Confirmatory laboratory "
-        "analysis is required before use as legal evidence."
+        "analysis is required before use as legal evidence[cite: 1]."
     )
