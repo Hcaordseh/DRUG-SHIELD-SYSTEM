@@ -2,3 +2,6 @@ streamlit
 opencv-python-headless
 numpy
 reportlab
+pytz
+webcolors
+scikit-learn
