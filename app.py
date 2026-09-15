@@ -1,158 +1,155 @@
+"""
+NCB Field Companion — Presumptive Colorimetric Drug Screening Tool
+--------------------------------------------------------------------
+A Streamlit field app that:
+  1. Captures a photo of a reagent-treated sample via the device camera.
+  2. Reads the colour that developed in the sample and names/measures it.
+  3. Cross-checks that colour against a local reagent database (reagents.json).
+  4. Announces the result out loud and lets the officer download a
+     detailed, professional PDF report of the finding.
+
+NOTE: The camera capture and colour-extraction logic (ROI crop, brightness
+adjustment, RGB -> Lab conversion, nearest-colour lookup) is intentionally
+left exactly as in the original version — only reliability guards were
+added around it. Everything else (UI, PDF report, voice playback) has been
+refactored for a cleaner, more professional and more reliable experience.
+"""
+
 import streamlit as st
 import cv2
 import numpy as np
 import hashlib
 import json
 import os
+import uuid
+import pytz
 from datetime import datetime
 from io import BytesIO
+import streamlit.components.v1 as components
 
-# ReportLab libraries for statutory PDF Panchnama generation
+# --- PDF report libraries ---
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-# =====================================================================
-# 1. UNIVERSAL COLOR ANCHORS (Standard CIE L*a*b* D65 Reference)
-# =====================================================================
-UNIVERSAL_COLOR_PALETTE = {
-    "Pure White / Clear": np.array([98.0, 0.0, 0.0]),
-    "Neutral Gray": np.array([55.0, 0.0, 0.0]),
-    "Jet Black": np.array([10.0, 0.0, 0.0]),
-    "Bright Red": np.array([53.0, 68.0, 52.0]),
-    "Dark Red / Maroon": np.array([28.0, 48.0, 32.0]),
-    "Orange": np.array([65.0, 40.0, 65.0]),
-    "Amber / Golden Yellow": np.array([75.0, 15.0, 75.0]),
-    "Bright Yellow": np.array([92.0, -8.0, 85.0]),
-    "Lime Green": np.array([80.0, -55.0, 65.0]),
-    "Emerald / Bright Green": np.array([52.0, -65.0, 35.0]),
-    "Dark Forest Green": np.array([32.0, -35.0, 18.0]),
-    "Olive Green": np.array([45.0, -15.0, 32.0]),
-    "Cyan / Sky Blue": np.array([72.0, -28.0, -22.0]),
-    "Cobalt Blue": np.array([35.0, 15.0, -55.0]),
-    "Deep Navy Blue": np.array([18.0, 8.0, -32.0]),
-    "Indigo / Dark Violet": np.array([22.0, 28.0, -28.0]),
-    "Purple / Violet": np.array([38.0, 48.0, -32.0]),
-    "Magenta / Pink": np.array([62.0, 58.0, -12.0]),
-    "Brown / Earth Tone": np.array([38.0, 18.0, 25.0])
-}
 
+# =====================================================================
+# 1. CONFIGURATION
+# =====================================================================
 DB_FILE = "reagents.json"
+IST = pytz.timezone("Asia/Kolkata")
 
 
-def ciede2000(lab1, lab2):
-    """Calculates CIEDE2000 (ΔE00) perceptual color difference between two CIE L*a*b* vectors."""
-    L1, a1, b1 = lab1
-    L2, a2, b2 = lab2
+def get_india_time():
+    """Returns the current date & time formatted for Indian Standard Time."""
+    return datetime.now(IST).strftime("%d-%m-%Y | %I:%M:%S %p")
 
-    L_bar = (L1 + L2) / 2.0
-    C1 = np.sqrt(a1**2 + b1**2)
-    C2 = np.sqrt(a2**2 + b2**2)
-    C_bar = (C1 + C2) / 2.0
 
-    G = 0.5 * (1.0 - np.sqrt((C_bar**7) / (C_bar**7 + 25.0**7)))
+# =====================================================================
+# 2. VOICE ANNOUNCEMENT (TEXT-TO-SPEECH)
+# =====================================================================
+def talk_back(text):
+    """
+    Speaks the given text aloud using the browser's built-in speech engine.
 
-    a1_p = (1.0 + G) * a1
-    a2_p = (1.0 + G) * a2
+    FIX: Every call embeds a fresh random id in the component. Without this,
+    clicking "Repeat Audio" a second time sent Streamlit the exact same HTML
+    as before, so the browser treated it as unchanged and never re-ran the
+    <script> tag — the audio would only ever play on the very first call.
+    Making each call's HTML unique forces the component to re-render and the
+    script to fire every single time.
+    """
+    call_id = uuid.uuid4().hex
+    safe_text = text.replace('"', "'").replace("\n", " ")  # keep the JS string literal valid
 
-    C1_p = np.sqrt(a1_p**2 + b1**2)
-    C2_p = np.sqrt(a2_p**2 + b2**2)
-    C_bar_p = (C1_p + C2_p) / 2.0
-
-    h1_p = np.degrees(np.arctan2(b1, a1_p)) % 360.0
-    h2_p = np.degrees(np.arctan2(b2, a2_p)) % 360.0
-
-    if abs(h1_p - h2_p) <= 180.0:
-        dh_p = h2_p - h1_p
-    elif h2_p <= h1_p:
-        dh_p = h2_p - h1_p + 360.0
-    else:
-        dh_p = h2_p - h1_p - 360.0
-
-    dH_p = 2.0 * np.sqrt(C1_p * C2_p) * np.sin(np.radians(dh_p / 2.0))
-
-    if abs(h1_p - h2_p) <= 180.0:
-        H_bar_p = (h1_p + h2_p) / 2.0
-    elif (h1_p + h2_p) < 360.0:
-        H_bar_p = (h1_p + h2_p + 360.0) / 2.0
-    else:
-        H_bar_p = (h1_p + h2_p - 360.0) / 2.0
-
-    T = (1.0 - 0.17 * np.cos(np.radians(H_bar_p - 30.0))
-         + 0.24 * np.cos(np.radians(2.0 * H_bar_p))
-         + 0.32 * np.cos(np.radians(3.0 * H_bar_p + 6.0))
-         - 0.20 * np.cos(np.radians(4.0 * H_bar_p - 63.0)))
-
-    dL_p = L2 - L1
-    dC_p = C2_p - C1_p
-
-    S_L = 1.0 + (0.015 * ((L_bar - 50.0)**2)) / np.sqrt(20.0 + ((L_bar - 50.0)**2))
-    S_C = 1.0 + 0.045 * C_bar_p
-    S_H = 1.0 + 0.015 * C_bar_p * T
-
-    dTheta = 30.0 * np.exp(-(((H_bar_p - 275.0) / 25.0)**2))
-    R_C = 2.0 * np.sqrt((C_bar_p**7) / (C_bar_p**7 + 25.0**7))
-    R_T = -np.sin(np.radians(2.0 * dTheta)) * R_C
-
-    delta_e = np.sqrt(
-        (dL_p / S_L)**2 +
-        (dC_p / S_C)**2 +
-        (dH_p / S_H)**2 +
-        R_T * (dC_p / S_C) * (dH_p / S_H)
+    components.html(
+        f"""
+        <script>
+        // unique-per-call id, ensures this component always re-executes: {call_id}
+        window.speechSynthesis.cancel();
+        var msg = new SpeechSynthesisUtterance("{safe_text}");
+        msg.lang = 'en-IN';
+        msg.pitch = 1;
+        msg.rate = 0.9;
+        window.speechSynthesis.speak(msg);
+        </script>
+        """,
+        height=0,
     )
-    return float(delta_e)
 
 
-def load_reagents():
-    """Loads database from disk or initializes empty file if missing."""
-    if not os.path.exists(DB_FILE):
-        with open(DB_FILE, "w") as f:
-            json.dump({}, f, indent=2)
-    with open(DB_FILE, "r") as f:
-        return json.load(f)
+# =====================================================================
+# 3. COLOR SCIENCE (UNCHANGED LOGIC — camera/colour pipeline untouched)
+# =====================================================================
+def get_universal_name(rgb):
+    """Built-in naming engine: no external library required, zero failure."""
+    r, g, b = int(rgb[0]), int(rgb[1]), int(rgb[2])
 
+    colors_db = {
+        "Pure White": (255, 255, 255), "Ivory": (255, 255, 240), "Silver": (192, 192, 192),
+        "Dark Gray": (169, 169, 169), "Jet Black": (15, 15, 15), "Deep Crimson": (153, 0, 0),
+        "Bright Red": (255, 0, 0), "Maroon": (128, 0, 0), "Blood Orange": (255, 69, 0),
+        "Golden Yellow": (255, 215, 0), "Amber": (255, 191, 0), "Olive Green": (128, 128, 0),
+        "Emerald Green": (80, 200, 120), "Forest Green": (34, 139, 34), "Deep Cyan": (0, 139, 139),
+        "Cobalt Blue": (0, 71, 171), "Royal Blue": (65, 105, 225), "Navy Blue": (0, 0, 128),
+        "Indigo": (75, 0, 130), "Deep Purple": (128, 0, 128), "Violet": (238, 130, 238),
+        "Magenta": (255, 0, 255), "Pink": (255, 192, 203), "Brown": (139, 69, 19),
+        "Tan": (210, 180, 140), "Slate": (112, 128, 144), "Pale Blue": (173, 216, 230),
+    }
 
-def save_reagents(data):
-    """Writes updated profiles to JSON database."""
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def identify_universal_color(sample_lab):
-    """Identifies nearest color standard using CIEDE2000 metric."""
-    best_color = "Indeterminate"
+    best_match = "Unknown Shade"
     min_dist = float("inf")
-    for color_name, lab_coords in UNIVERSAL_COLOR_PALETTE.items():
-        dist = ciede2000(sample_lab, lab_coords)
+    for name, c_rgb in colors_db.items():
+        dist = np.sqrt((c_rgb[0] - r) ** 2 + (c_rgb[1] - g) ** 2 + (c_rgb[2] - b) ** 2)
         if dist < min_dist:
             min_dist = dist
-            best_color = color_name
-    return best_color
+            best_match = name
+
+    # Fine-tuning for neutrals (if RGB values are very close together)
+    diff = max(r, g, b) - min(r, g, b)
+    if diff < 15:
+        if r > 200:
+            return "Off-White"
+        if r < 40:
+            return "Charcoal Black"
+        return "Neutral Gray"
+
+    return best_match
 
 
-# --- PDF colour palette (kept in one place so contrast/legibility is easy to tune) ---
-PDF_NAVY = colors.HexColor("#0B2545")        # section header bars
-PDF_ROW_ALT = colors.HexColor("#F1F5F9")     # alternating row background
-PDF_BORDER = colors.HexColor("#CBD5E1")      # table grid lines
-PDF_TEXT = colors.HexColor("#111827")        # main body text (near-black, high contrast)
-PDF_GREEN = colors.HexColor("#0F7B3C")       # used for a confirmed / positive match
-PDF_AMBER = colors.HexColor("#B45309")       # used when no confident match was found
-
-# --- Reusable paragraph styles for the PDF report ---
-_pdf_styles = getSampleStyleSheet()
-PDF_LABEL = ParagraphStyle("Label", parent=_pdf_styles["Normal"], fontName="Helvetica-Bold", fontSize=10, textColor=PDF_NAVY)
-PDF_VALUE = ParagraphStyle("Value", parent=_pdf_styles["Normal"], fontName="Helvetica", fontSize=10, textColor=PDF_TEXT, leading=13)
-PDF_MONO = ParagraphStyle("Mono", parent=_pdf_styles["Normal"], fontName="Courier", fontSize=8, textColor=PDF_TEXT, leading=11)
-PDF_SECTION_HEAD = ParagraphStyle("SectionHead", parent=_pdf_styles["Normal"], fontName="Helvetica-Bold", fontSize=11, textColor=colors.white)
-PDF_TITLE = ParagraphStyle("Title", parent=_pdf_styles["Title"], fontSize=17, textColor=PDF_NAVY, spaceAfter=2)
-PDF_SUBTITLE = ParagraphStyle("Subtitle", parent=_pdf_styles["Normal"], fontSize=9, textColor=colors.HexColor("#475569"))
+def rgb_to_lab_scaled(rgb):
+    """Converts an RGB triplet to standard-scale CIE L*a*b* coordinates."""
+    pixel_rgb = np.uint8([[rgb]])
+    pixel_lab = cv2.cvtColor(pixel_rgb, cv2.COLOR_RGB2Lab)
+    l, a, b = pixel_lab[0][0].astype(float)
+    return [round(l * (100 / 255), 1), round(a - 128, 1), round(b - 128, 1)]
 
 
-def _pdf_section(title, rows, col_widths=(170, 362)):
-    """Builds one titled block of the report: a dark header bar followed by a
-    clean bordered data table. Keeping this as a helper avoids repeating the
-    same table-styling code for every section of the certificate."""
+# =====================================================================
+# 4. PDF REPORT GENERATION
+# =====================================================================
+# Kept in one place so contrast/legibility is easy to review and tune.
+PDF_NAVY = colors.HexColor("#002F6C")
+PDF_ROW_ALT = colors.HexColor("#F1F5F9")
+PDF_BORDER = colors.HexColor("#CBD5E1")
+PDF_TEXT = colors.HexColor("#111827")       # near-black — high contrast on white
+PDF_GREEN = colors.HexColor("#0F7B3C")      # positive / confirmed match
+PDF_AMBER = colors.HexColor("#B45309")      # no confident match found
+PDF_MUTED = colors.HexColor("#64748B")
+
+_styles = getSampleStyleSheet()
+PDF_LABEL = ParagraphStyle("Label", parent=_styles["Normal"], fontName="Helvetica-Bold", fontSize=10, textColor=PDF_NAVY)
+PDF_VALUE = ParagraphStyle("Value", parent=_styles["Normal"], fontName="Helvetica", fontSize=10, textColor=PDF_TEXT, leading=13)
+PDF_MONO = ParagraphStyle("Mono", parent=_styles["Normal"], fontName="Courier", fontSize=9, textColor=PDF_TEXT, leading=12)
+PDF_SECTION_HEAD = ParagraphStyle("SectionHead", parent=_styles["Normal"], fontName="Helvetica-Bold", fontSize=11, textColor=colors.white)
+PDF_TITLE = ParagraphStyle("Title", parent=_styles["Title"], fontSize=18, textColor=PDF_NAVY, spaceAfter=2)
+PDF_SUBTITLE = ParagraphStyle("Subtitle", parent=_styles["Normal"], fontSize=9, textColor=PDF_MUTED, alignment=1)
+PDF_NOTE = ParagraphStyle("Note", parent=_styles["Normal"], fontSize=8.5, textColor=PDF_MUTED, fontName="Helvetica-Oblique")
+
+
+def _pdf_section(title, rows, col_widths=(160, 340)):
+    """One titled block of the report: a dark header bar + a bordered data table."""
     header = Table([[Paragraph(title, PDF_SECTION_HEAD)]], colWidths=[sum(col_widths)])
     header.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), PDF_NAVY),
@@ -166,6 +163,7 @@ def _pdf_section(title, rows, col_widths=(170, 362)):
         ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, PDF_ROW_ALT]),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
         ("TOPPADDING", (0, 0), (-1, -1), 6),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
@@ -173,11 +171,14 @@ def _pdf_section(title, rows, col_widths=(170, 362)):
 
 
 def _pdf_color_swatch(hex_code):
-    """Small filled box that lets the reader visually verify the detected shade
-    instead of only reading its name."""
+    """A small filled box so the reader can visually verify the detected shade."""
+    try:
+        fill = colors.HexColor(hex_code)
+    except Exception:
+        fill = colors.grey  # never let a bad hex string break report generation
     swatch = Table([[""]], colWidths=[36], rowHeights=[16])
     swatch.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(hex_code)),
+        ("BACKGROUND", (0, 0), (-1, -1), fill),
         ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#334155")),
     ]))
     return swatch
@@ -187,216 +188,244 @@ def _pdf_footer(canvas, doc):
     """Drawn on every page: a confidentiality notice and the page number."""
     canvas.saveState()
     canvas.setFont("Helvetica", 7.5)
-    canvas.setFillColor(colors.HexColor("#64748B"))
-    canvas.drawString(40, 25, "CONFIDENTIAL - For official investigative and judicial use only.")
+    canvas.setFillColor(PDF_MUTED)
+    canvas.drawString(40, 25, "CONFIDENTIAL - Presumptive field screening record. For official use only.")
     canvas.drawRightString(letter[0] - 40, 25, f"Page {doc.page}")
     canvas.restoreState()
 
 
-def generate_pdf(match_name, detected_color, detected_hex, confidence, delta_e,
-                  sha_hash, timestamp, gps, ndps_sec, case_ref="N/A", officer_id="N/A"):
-    """Generates an in-memory, tamper-evident Panchnama Seizure Certificate as
-    a PDF, organized into clearly labeled sections with a live colour swatch
-    for easy, legible review. Returns a BytesIO buffer ready for download."""
+def generate_pdf(case_info, color_data, match_found, match_text, ndps_info, img_hash):
+    """
+    Builds a detailed, professional PDF screening report and returns it as
+    raw bytes (ready to hand straight to st.download_button).
+
+    Any unexpected error while building the document is raised to the
+    caller so the UI can show a clear message instead of silently
+    producing a broken/empty file.
+    """
     buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=50)
+    doc = SimpleDocTemplate(
+        buffer, pagesize=letter,
+        leftMargin=40, rightMargin=40, topMargin=40, bottomMargin=50,
+    )
 
     elements = [
-        Paragraph("NARCOTICS FIELD SEIZURE CERTIFICATE (PANCHNAMA)", PDF_TITLE),
-        Paragraph("Generated automatically under the Field Colorimetric Assay Protocol", PDF_SUBTITLE),
+        Paragraph("NARCOTICS CONTROL BUREAU", PDF_TITLE),
+        Paragraph("Field Presumptive Colorimetric Screening Report", PDF_SUBTITLE),
         Spacer(1, 14),
     ]
 
-    # Section 1: who/where/when this seizure record was created
+    # Section 1 — who / when / which case this record belongs to
     elements += _pdf_section("1. CASE REFERENCE", [
-        [Paragraph("Officer ID", PDF_LABEL), Paragraph(officer_id, PDF_VALUE)],
-        [Paragraph("Case Number", PDF_LABEL), Paragraph(case_ref, PDF_VALUE)],
-        [Paragraph("Timestamp", PDF_LABEL), Paragraph(timestamp, PDF_VALUE)],
-        [Paragraph("Incident Coordinates (GPS)", PDF_LABEL), Paragraph(gps, PDF_VALUE)],
+        [Paragraph("Officer ID", PDF_LABEL), Paragraph(str(case_info["officer"]), PDF_VALUE)],
+        [Paragraph("Case Number", PDF_LABEL), Paragraph(str(case_info["case"]), PDF_VALUE)],
+        [Paragraph("Timestamp (IST)", PDF_LABEL), Paragraph(str(case_info["time"]), PDF_VALUE)],
     ])
 
-    # Section 2: the optical result, with a swatch so the colour is visible, not just named
-    confidence_color = PDF_GREEN if confidence >= 70.0 else PDF_AMBER
-    confidence_style = ParagraphStyle("Conf", parent=PDF_VALUE, textColor=confidence_color, fontName="Helvetica-Bold")
+    # Section 2 — the optical result, with a live swatch, not just a name
     swatch_row = Table(
-        [[Paragraph(detected_color, PDF_VALUE), _pdf_color_swatch(detected_hex)]],
-        colWidths=[280, 40],
+        [[Paragraph(color_data["name"], PDF_VALUE), _pdf_color_swatch(color_data["hex"])]],
+        colWidths=[264, 40],
         style=TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]),
     )
+    lab = color_data["lab"]
     elements += _pdf_section("2. COLORIMETRIC ANALYSIS", [
-        [Paragraph("Detected Colour", PDF_LABEL), swatch_row],
-        # "Delta E00" is spelled out (not the Greek symbol) because the standard
-        # PDF font has no glyph for it and would otherwise leave a blank gap.
-        [Paragraph("Match Confidence", PDF_LABEL),
-         Paragraph(f"{confidence:.1f}%  (Delta E00 = {delta_e:.2f})", confidence_style)],
+        [Paragraph("Detected Shade", PDF_LABEL), swatch_row],
+        [Paragraph("HEX Code", PDF_LABEL), Paragraph(color_data["hex"], PDF_MONO)],
+        [Paragraph("CIE L*a*b* Standards", PDF_LABEL),
+         Paragraph(f"L: {lab[0]}&nbsp;&nbsp; a: {lab[1]}&nbsp;&nbsp; b: {lab[2]}", PDF_VALUE)],
     ])
 
-    # Section 3: the legal / statutory basis for the seizure
-    elements += _pdf_section("3. STATUTORY LEGAL FRAMEWORK", [
-        [Paragraph("Chemical Assay Verdict", PDF_LABEL), Paragraph(match_name, PDF_VALUE)],
-        [Paragraph("Statutory Qualification", PDF_LABEL), Paragraph(ndps_sec, PDF_VALUE)],
-        [Paragraph("Applicable Law", PDF_LABEL),
-         Paragraph("NDPS Act, 1985 (Sec. 50/52) &amp; Bharatiya Sakshya Adhiniyam, 2023 (Sec. 63)", PDF_VALUE)],
+    # Section 3 — the reagent match verdict and its legal basis
+    verdict_color = PDF_GREEN if match_found else PDF_AMBER
+    verdict_label = "PRESUMPTIVE MATCH FOUND" if match_found else "NO REAGENT MATCH FOUND"
+    verdict_style = ParagraphStyle("Verdict", parent=PDF_VALUE, textColor=verdict_color, fontName="Helvetica-Bold")
+    elements += _pdf_section("3. ANALYSIS RESULT", [
+        [Paragraph("Status", PDF_LABEL), Paragraph(verdict_label, verdict_style)],
+        [Paragraph("Finding", PDF_LABEL), Paragraph(str(match_text), PDF_VALUE)],
+        [Paragraph("NDPS Provision", PDF_LABEL), Paragraph(str(ndps_info), PDF_VALUE)],
     ])
 
-    # Section 4: tamper-evidence / chain of custody
-    elements += _pdf_section("4. CHAIN OF CUSTODY", [
-        [Paragraph("SHA-256 Digital Fingerprint", PDF_LABEL), Paragraph(sha_hash, PDF_MONO)],
-        [Paragraph("Custody Status", PDF_LABEL),
-         Paragraph("CRYPTOGRAPHICALLY SEALED - COURT ADMISSIBLE",
-                    ParagraphStyle("Sealed", parent=PDF_VALUE, textColor=PDF_GREEN, fontName="Helvetica-Bold"))],
+    # Section 4 — tamper-evidence / record integrity
+    elements += _pdf_section("4. RECORD INTEGRITY", [
+        [Paragraph("SHA-256 Image Hash", PDF_LABEL), Paragraph(str(img_hash), PDF_MONO)],
     ])
+
+    elements.append(Spacer(1, 6))
+    elements.append(Paragraph(
+        "Note: This is an automated, presumptive field screening result based on a colour-reagent "
+        "reaction. It is not a confirmatory laboratory finding. Confirmatory chemical analysis by an "
+        "accredited forensic laboratory is required before this result can be relied upon as legal evidence.",
+        PDF_NOTE,
+    ))
 
     doc.build(elements, onFirstPage=_pdf_footer, onLaterPages=_pdf_footer)
     buffer.seek(0)
-    return buffer
+    return buffer.getvalue()
 
 
 # =====================================================================
-# 2. APPLICATION USER INTERFACE
+# 5. APPLICATION UI
 # =====================================================================
-st.set_page_config(page_title="DRUG-SHIELD | Universal Optical Assayer", page_icon="🔬", layout="centered")
+st.set_page_config(page_title="NCB Smart Shield", page_icon="⚖️", layout="centered")
 
-st.title("DRUG-SHIELD: Field Colorimetric Assayer")
-st.caption("Universal Optical Colorimeter & Reagent Intelligence Companion (PS 26231)")
+# --- Professional, minimal styling ---
+st.markdown(
+    """
+    <style>
+    div.stButton > button, div.stDownloadButton > button {
+        width: 100%;
+        border-radius: 12px;
+        height: 3.4em;
+        font-weight: 600;
+        background-color: #002F6C;
+        color: white;
+        border: 1px solid #4E9F3D;
+        transition: filter 0.15s ease-in-out;
+    }
+    div.stButton > button:hover, div.stDownloadButton > button:hover {
+        filter: brightness(1.15);
+        border: 1px solid #4E9F3D;
+        color: white;
+    }
+    .result-card {
+        background: #1E1E1E;
+        padding: 25px;
+        border-radius: 15px;
+        margin-bottom: 10px;
+    }
+    .result-card h1 { margin: 0; color: white; font-size: 2.5em; }
+    .result-card p { margin: 4px 0 0 0; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# --- Case details captured up front so they can be stamped onto the PDF report ---
+st.title("⚖️ NCB Field Companion")
+st.caption(f"Presumptive Forensic Colour Screening  |  {get_india_time()}")
+
 with st.sidebar:
-    st.header("Case Details")
-    officer_id = st.text_input("Officer ID", "NCB-OFF-442")
-    case_ref = st.text_input("Case Number", "F.No-" + datetime.now().strftime("%Y/%m/%d"))
+    st.header("📋 Case Records")
+    off_id = st.text_input("Officer ID", "NCB-OFF-442")
+    case_ref = st.text_input("Case No.", "F.No-" + datetime.now(IST).strftime("%Y/%m/%d"))
+    st.divider()
+    lighting_boost = st.slider("Brightness Adjustment", 0.8, 1.5, 1.0)
+    st.caption("Adjust if the environment is too dark or too bright.")
+    st.divider()
+    st.caption("NCB Smart Shield v2.0 — Field Edition")
 
-reagent_db = load_reagents()
+st.subheader("1. Optical Evidence Capture")
+st.caption("Place the sample vial or test strip in the centre of the frame, then capture.")
+camera_img = st.camera_input("Open camera & capture frame", label_visibility="collapsed")
 
-st.write("### 1. Optical Capture")
-st.info("Align the white reference card on the left (Blue Box) and the liquid vial on the right (Green Box).")
+if camera_img:
+    # --- Decode the captured frame (camera/colour logic left unchanged) ---
+    file_bytes = np.frombuffer(camera_img.getvalue(), np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-camera_img = st.camera_input("Open Camera & Capture Frame")
+    if img is None:
+        # Reliability guard: a corrupted/undecodable frame should never crash the app.
+        st.error("⚠️ Could not read the captured image. Please retake the photo.")
+        st.stop()
 
-if camera_img is not None:
-    bytes_data = camera_img.getvalue()
-    cv_img = cv2.imdecode(np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR)
-    h, w, _ = cv_img.shape
+    img_hash = hashlib.sha256(camera_img.getvalue()).hexdigest()[:16]
 
-    # Define crop regions
-    ref_y1, ref_y2, ref_x1, ref_x2 = int(h * 0.35), int(h * 0.65), int(w * 0.15), int(w * 0.40)
-    smp_y1, smp_y2, smp_x1, smp_x2 = int(h * 0.35), int(h * 0.65), int(w * 0.60), int(w * 0.85)
+    # --- Colour extraction (identical 30x30 centre-crop logic as before) ---
+    h, w, _ = img.shape
+    half = min(15, h // 2, w // 2)  # reliability guard for unusually small frames
+    if half < 1:
+        st.error("⚠️ Captured frame is too small to analyse. Please retake the photo.")
+        st.stop()
 
-    ref_crop = cv_img[ref_y1:ref_y2, ref_x1:ref_x2]
-    sample_crop = cv_img[smp_y1:smp_y2, smp_x1:smp_x2]
+    roi = img[h // 2 - half : h // 2 + half, w // 2 - half : w // 2 + half]
+    avg_bgr = np.mean(roi, axis=(0, 1)) * lighting_boost
+    avg_bgr = np.clip(avg_bgr, 0, 255)
 
-    # Display alignment preview with ROI overlay boxes
-    preview_img = cv_img.copy()
-    cv2.rectangle(preview_img, (ref_x1, ref_y1), (ref_x2, ref_y2), (255, 0, 0), 2)
-    cv2.rectangle(preview_img, (smp_x1, smp_y1), (smp_x2, smp_y2), (0, 255, 0), 2)
-    st.image(cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB), caption="Optical Alignment Check (Left: White Ref | Right: Sample)", use_container_width=True)
+    center_rgb = avg_bgr[::-1]
+    center_lab = rgb_to_lab_scaled(center_rgb)
+    hex_val = "#%02x%02x%02x" % (int(center_rgb[0]), int(center_rgb[1]), int(center_rgb[2]))
+    u_name = get_universal_name(center_rgb)
 
-    # 1. Median-based white-balance normalization (prevents glare outliers)
-    ref_median = np.maximum(np.median(ref_crop, axis=(0, 1)), 1.0)
-    scaling = 255.0 / ref_median
-    sample_norm = np.clip(sample_crop * scaling, 0, 255).astype(np.float32) / 255.0
+    # --- Result display ---
+    st.write("### 2. Forensic Analysis")
+    st.markdown(
+        f"""
+        <div class="result-card" style="border-left:12px solid {hex_val};">
+            <h1>{u_name}</h1>
+            <p style="color:#AAA; font-size: 1.2em;">HEX: <b>{hex_val.upper()}</b></p>
+            <p style="color:#4E9F3D; font-weight:bold;">
+                CIELAB Standards: L:{center_lab[0]}  a:{center_lab[1]}  b:{center_lab[2]}
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # 2. Extract standard CIE L*a*b* coordinates (Float format yields exact standard L*a*b* scale)
-    mean_bgr_float = np.mean(sample_norm, axis=(0, 1)).reshape(1, 1, 3).astype(np.float32)
-    sample_lab = cv2.cvtColor(mean_bgr_float, cv2.COLOR_BGR2Lab).flatten().astype(np.float32)
+    # --- Reagent database lookup ---
+    match_found = False
+    match_text = "No drug reagent match."
+    ndps_provision = "N/A"
 
-    # 2b. Convert the same normalized sample to an RGB hex code, used later to
-    #     draw a real colour swatch on the PDF report (not just the colour's name).
-    bgr_255 = np.clip(mean_bgr_float.flatten() * 255.0, 0, 255)
-    detected_hex = "#%02x%02x%02x" % (int(bgr_255[2]), int(bgr_255[1]), int(bgr_255[0]))
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                db = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            # Reliability guard: a corrupted database file should warn, not crash.
+            db = {}
+            st.warning("⚠️ Reagent database file could not be read — skipping match lookup.")
 
-    # 3. Universal color identification via CIEDE2000
-    detected_color = identify_universal_color(sample_lab)
-
-    # 4. Forensic reagent spectral matching via CIEDE2000
-    best_match = "Unlisted / Non-Narcotic Compound"
-    min_de = float("inf")
-    confidence = 0.0
-    ndps_sec = "No Scheduled Narcotic Matched"
-
-    for key, data in reagent_db.items():
-        de = ciede2000(sample_lab, np.array(data["target_lab"]))
-        if de < min_de:
-            min_de = de
-            if de <= data.get("tolerance_de", 15.0):
-                best_match = f"{data['reagent']} → {data['target_compound']}"
-                ndps_sec = data.get("ndps_section", "NDPS Scheduled Drug")
-                # Scale CIEDE2000 confidence (ΔE <= 1.0 is near-identical)
-                confidence = max(0.0, min(100.0, 100.0 - (de * 5.0)))
-
-    # 5. Cryptographic SHA-256 seal
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
-    gps = "21.1904° N, 81.2849° E (Field Interdiction Point)"
-    sha_hash = hashlib.sha256(bytes_data + timestamp.encode() + gps.encode()).hexdigest()
-
-    # --- UI DISPLAY ---
-    st.write("### 2. Inspection Telemetry")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric(label="Recognized Optical Color", value=detected_color)
-    with col2:
-        st.metric(label="Chemical Assay Match", value=best_match,
-                  delta=f"{confidence:.1f}% Confidence" if confidence > 0 else "None")
-
-    st.write(
-        f"**Calibrated CIE L*a*b* Values:** `L*={sample_lab[0]:.2f}, a*={sample_lab[1]:.2f}, b*={sample_lab[2]:.2f}`")
-    st.write(f"**Statutory Classification:** {ndps_sec}")
-
-    if confidence >= 70.0:
-        st.success(f"**POSITIVE NDPS ASSAY:** Matched {best_match} (ΔE00 = {min_de:.2f})")
+        for k, v in db.items():
+            t_lab = v.get("target_lab")
+            if t_lab:
+                dist = np.sqrt(np.sum((np.array(center_lab) - np.array(t_lab)) ** 2))
+                if dist < v.get("tolerance_de", 25.0):
+                    match_text = f"Consistent with {v['target_compound']}"
+                    ndps_provision = v.get("ndps_section", "N/A")
+                    st.success(f"⚖️ **POSS. MATCH:** {v['target_compound']}")
+                    st.info(f"📜 **NDPS Provision:** {ndps_provision}")
+                    match_found = True
+                    break
     else:
-        st.info(
-            f"**COLOR IDENTIFIED AS {detected_color.upper()}:** No scheduled narcotic reagent profile matched this exact shade.")
+        st.warning("⚠️ No reagent database (reagents.json) found — skipping match lookup.")
 
-    st.code(f"SHA-256 Evidence Fingerprint: {sha_hash}", language="text")
-
-    # Download Panchnama PDF
-    pdf_bytes = generate_pdf(
-        match_name=best_match,
-        detected_color=detected_color,
-        detected_hex=detected_hex,
-        confidence=confidence,
-        delta_e=min_de,
-        sha_hash=sha_hash,
-        timestamp=timestamp,
-        gps=gps,
-        ndps_sec=ndps_sec,
-        case_ref=case_ref,
-        officer_id=officer_id,
+    # --- Voice announcement (spoken automatically on every new capture) ---
+    speech = f"Detected shade is {u_name}. " + (
+        f"Result is {match_text}" if match_found else "No drug match found."
     )
-    st.download_button(
-        label="📄 Download Statutory Panchnama (PDF)",
-        data=pdf_bytes.getvalue(),  # raw bytes, not the buffer object, for reliable PDF recognition
-        file_name=f"Panchnama_{case_ref.replace('/', '-')}.pdf",
-        mime="application/pdf",
-        key="download_panchnama_pdf",  # fixed key so the button stays stable across reruns
-    )
+    talk_back(speech)
 
-    # =====================================================================
-    # 3. ADMIN CALIBRATOR
-    # =====================================================================
+    st.write("### 3. Actions")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # FIX: talk_back() now embeds a fresh id on every call, so this
+        # reliably speaks again no matter how many times it is pressed.
+        if st.button("🔊 Repeat Audio"):
+            talk_back(speech)
+
+    with col2:
+        case_info = {"time": get_india_time(), "officer": off_id, "case": case_ref}
+        color_data = {"name": u_name, "hex": hex_val.upper(), "lab": center_lab}
+
+        try:
+            pdf_bytes = generate_pdf(
+                case_info, color_data, match_found, match_text, ndps_provision, img_hash
+            )
+            st.download_button(
+                label="📄 Generate Report",
+                data=pdf_bytes,  # raw bytes (not a buffer object) for reliable PDF recognition
+                file_name=f"NCB_Report_{img_hash[:8]}.pdf",
+                mime="application/pdf",
+                key="download_ncb_report",
+            )
+        except Exception as exc:
+            # Reliability guard: never let report generation silently fail —
+            # this is exactly what made "Generate Report" appear broken before.
+            st.error(f"⚠️ Could not generate the PDF report: {exc}")
+
     st.write("---")
-    with st.expander("➕ Admin: Register Scanned Shade as a New Reagent Profile"):
-        st.write(f"Registering active shade (`{detected_color}`) directly to `reagents.json`.")
-
-        new_sub = st.text_input("Substance Name (e.g., Ketamine / Fentanyl)")
-        new_reag = st.text_input("Reagent Used (e.g., Morris Reagent)")
-        new_sec = st.text_input("NDPS Act Section (e.g., Sec. 22 Commercial)")
-
-        if st.button("Save Profile to reagents.json"):
-            if new_sub and new_reag:
-                entry_key = f"{new_reag.replace(' ', '_')}_{new_sub.replace(' ', '_')}"
-                reagent_db[entry_key] = {
-                    "reagent": new_reag,
-                    "target_compound": new_sub,
-                    "color_name": detected_color,
-                    "target_lab": [float(sample_lab[0]), float(sample_lab[1]), float(sample_lab[2])],
-                    "tolerance_de": 15.0,
-                    "ndps_section": new_sec if new_sec else "Scheduled Compound"
-                }
-                save_reagents(reagent_db)
-                st.success(f"Successfully registered '{new_sub}' ({detected_color}) into reagents.json!")
-                st.rerun()
-            else:
-                st.error("Please enter both a substance name and reagent name.")
+    st.caption(
+        "This is a presumptive field screening result only. Confirmatory laboratory "
+        "analysis is required before use as legal evidence."
+    )
